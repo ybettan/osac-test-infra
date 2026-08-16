@@ -1,0 +1,316 @@
+---
+# TEMP: Uses ubuntu-latest + GitHub secrets instead of osac-ci-orchestrator
+# + Vault. To move to upstream: replace ubuntu-latest with
+# osac-ci-orchestrator, replace ${{ secrets.* }} reads with
+# validate-and-bootstrap + fetch-* Vault actions, and call
+# ec2-runner-provision.yml / ec2-runner-teardown.yml instead of inlining.
+name: E2E CaaS Agentless-Net Full Install
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      instance-type:
+        description: "EC2 instance type"
+        required: false
+        type: string
+        default: "c5n.metal"
+      aws-region:
+        description: "AWS region to launch into"
+        required: false
+        type: string
+        default: "us-east-1"
+      tooling-check-cmds:
+        description: "Semicolon-separated commands to verify on the box before JIT registration."
+        required: false
+        type: string
+        default: "dnf install -y ansible-core python3-pip make; pip3 install ansible; command -v ansible-playbook; command -v make"
+      osac-operator-image:
+        description: "Override osac-operator image -- empty means no override"
+        required: false
+        type: string
+        default: ""
+      fulfillment-service-image:
+        description: "Override fulfillment-service image -- empty means no override"
+        required: false
+        type: string
+        default: ""
+      osac-aap-ee-image:
+        description: "Override osac-aap execution-environment image -- empty means no override"
+        required: false
+        type: string
+        default: ""
+      osac-repo:
+        description: "Override osac mono-repo git URI -- empty means upstream"
+        required: false
+        type: string
+        default: ""
+      osac-branch:
+        description: "Branch, tag, or commit of the osac mono-repo to clone -- empty means main"
+        required: false
+        type: string
+        default: ""
+      components:
+        description: >-
+          JSON array of components to build from source on the EC2 box.
+          Empty array (default) builds nothing from source.
+        required: false
+        type: string
+        default: "[]"
+      fork-pr-author-association:
+        description: "PR author_association from the caller"
+        required: false
+        type: string
+        default: ""
+      fork-pr-author:
+        description: "GitHub login of the PR author"
+        required: false
+        type: string
+        default: ""
+      pr-number:
+        description: "PR number"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      result:
+        description: "Overall result: PASSED or FAILED"
+        value: ${{ jobs.e2e.outputs.result }}
+
+jobs:
+  # TEMP: inlined provision using GitHub secrets instead of calling
+  # ec2-runner-provision.yml (which requires osac-ci-orchestrator + Vault).
+  # Same scripts, same env vars — only the secret source changes.
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      KNOWN_HOSTS_FILE: /tmp/osac-ec2-known-hosts-${{ github.run_id }}-${{ github.run_attempt }}
+    outputs:
+      instance-id: ${{ steps.provision.outputs.instance-id }}
+      public-ip: ${{ steps.provision.outputs.public-ip }}
+      ssh-user: ${{ steps.provision.outputs.ssh-user }}
+      runner-label: ${{ steps.register.outputs.runner-label }}
+      runner-id: ${{ steps.register.outputs.runner-id }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &>/dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+
+      - name: Write SSH keypair
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.EC2_SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/osac_ec2_orchestrator
+          chmod 600 ~/.ssh/osac_ec2_orchestrator
+          printf '%s\n' "${SSH_PUBLIC_KEY}" > ~/.ssh/osac_ec2_orchestrator.pub
+          chmod 644 ~/.ssh/osac_ec2_orchestrator.pub
+
+      - name: Provision ephemeral EC2 instance
+        id: provision
+        env:
+          AMI_ID: ${{ secrets.EC2_AMI_ID }}
+          INSTANCE_TYPE: ${{ inputs.instance-type }}
+          SUBNET_ID: ${{ secrets.EC2_SUBNET_ID }}
+          SECURITY_GROUP_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.EC2_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.EC2_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+          EC2_KEY_PAIR: ${{ secrets.EC2_KEY_PAIR }}
+        run: |
+          export ORCHESTRATOR_PUBKEY_PATH="${HOME}/.ssh/osac_ec2_orchestrator.pub"
+          export SSH_KEY_PATH="${HOME}/.ssh/osac_ec2_orchestrator"
+          ./scripts/ec2-runner/provision.sh
+
+      - name: Verify tooling and register JIT runner
+        id: register
+        env:
+          SSH_USER: ${{ steps.provision.outputs.ssh-user }}
+          PUBLIC_IP: ${{ steps.provision.outputs.public-ip }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ secrets.EC2_GITHUB_PAT }}
+          TOOLING_CHECK_CMDS: ${{ inputs.tooling-check-cmds }}
+        run: |
+          export SSH_KEY_PATH="${HOME}/.ssh/osac_ec2_orchestrator"
+          ./scripts/ec2-runner/verify-and-register.sh
+
+      - name: Install and start runner
+        env:
+          SSH_USER: ${{ steps.provision.outputs.ssh-user }}
+          PUBLIC_IP: ${{ steps.provision.outputs.public-ip }}
+          JIT_CONFIG: ${{ steps.register.outputs.jit-config }}
+        run: |
+          export SSH_KEY_PATH="${HOME}/.ssh/osac_ec2_orchestrator"
+          ./scripts/ec2-runner/start-runner.sh
+
+  # TEMP: inlined push-secrets using GitHub secrets instead of Vault.
+  push-secrets:
+    needs: provision
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KNOWN_HOSTS_FILE: /tmp/osac-ec2-known-hosts-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Write SSH key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > ~/.ssh/osac_ec2_orchestrator
+          chmod 600 ~/.ssh/osac_ec2_orchestrator
+
+      - name: Write secrets to temp files
+        env:
+          PULL_SECRET: ${{ secrets.PULL_SECRET }}
+          AAP_LICENSE: ${{ secrets.AAP_LICENSE_B64 }}
+        run: |
+          printf '%s' "${PULL_SECRET}" > "$RUNNER_TEMP/pull-secret.json"
+          chmod 600 "$RUNNER_TEMP/pull-secret.json"
+          printf '%s' "${AAP_LICENSE}" | base64 -d > "$RUNNER_TEMP/aap-license.zip"
+          chmod 600 "$RUNNER_TEMP/aap-license.zip"
+
+      - name: Push secrets to EC2 box
+        env:
+          SSH_USER: ${{ needs.provision.outputs.ssh-user }}
+          PUBLIC_IP: ${{ needs.provision.outputs.public-ip }}
+          ROUTE53_AWS_ACCESS_KEY_ID: ${{ secrets.ROUTE53_AWS_ACCESS_KEY_ID }}
+          ROUTE53_AWS_SECRET_ACCESS_KEY: ${{ secrets.ROUTE53_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          LAB_NAME: ci-${{ github.run_id }}
+        run: |
+          SSH_KEY_PATH="${HOME}/.ssh/osac_ec2_orchestrator"
+          SSH_OPTS="-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=${KNOWN_HOSTS_FILE} -i ${SSH_KEY_PATH}"
+          STAGING_DIR="/root/agentless-net-secrets"
+
+          ssh ${SSH_OPTS} ${SSH_USER}@${PUBLIC_IP} "mkdir -p ${STAGING_DIR}"
+          scp ${SSH_OPTS} "$RUNNER_TEMP/pull-secret.json" "${SSH_USER}@${PUBLIC_IP}:${STAGING_DIR}/pull-secret"
+          scp ${SSH_OPTS} "$RUNNER_TEMP/aap-license.zip" "${SSH_USER}@${PUBLIC_IP}:${STAGING_DIR}/license.zip"
+
+          ssh ${SSH_OPTS} ${SSH_USER}@${PUBLIC_IP} "cat > ${STAGING_DIR}/config" <<EOF
+          LAB_NAME=${LAB_NAME}
+          AWS_ACCESS_KEY_ID=${ROUTE53_AWS_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY=${ROUTE53_AWS_SECRET_ACCESS_KEY}
+          AWS_DEFAULT_REGION=${AWS_REGION}
+          EOF
+
+          echo "Secrets staged at ${STAGING_DIR} on ${PUBLIC_IP}"
+
+  e2e:
+    needs: [provision, push-secrets]
+    runs-on: ${{ needs.provision.outputs.runner-label }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.deploy-caas.outcome == 'success' && 'PASSED' || 'FAILED' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Stage secrets into place
+        run: |
+          STAGING_DIR="/root/agentless-net-secrets"
+          cp "${STAGING_DIR}/pull-secret" /root/pull-secret
+          chmod 600 /root/pull-secret
+          if [ -f "${STAGING_DIR}/license.zip" ]; then
+            cp "${STAGING_DIR}/license.zip" infra/agentless-net/license.zip
+            chmod 600 infra/agentless-net/license.zip
+          fi
+          if [ -f "${STAGING_DIR}/config" ]; then
+            cp "${STAGING_DIR}/config" infra/agentless-net/config
+          fi
+          echo "Secrets staged"
+
+      - name: Install prerequisites (stub)
+        timeout-minutes: 30
+        run: make setup-infra INFRA=agentless-net SUITE=caas
+
+      - name: Deploy containerlab fabric (stub)
+        timeout-minutes: 30
+        run: make deploy-infra INFRA=agentless-net SUITE=caas
+
+      - name: Deploy OCP from snapshot (stub)
+        timeout-minutes: 30
+        run: make deploy-ocp INFRA=agentless-net SUITE=caas
+
+      - name: Deploy OSAC (stub)
+        timeout-minutes: 30
+        run: make deploy-osac INFRA=agentless-net SUITE=caas
+
+      - name: Setup CaaS hosts (stub)
+        timeout-minutes: 30
+        run: make setup-suite INFRA=agentless-net SUITE=caas
+
+      - name: Deploy CaaS cluster (stub)
+        id: deploy-caas
+        timeout-minutes: 90
+        run: make -C infra/agentless-net deploy-caas
+
+      - name: Verify .env.infra was written
+        run: |
+          if [ ! -f infra/agentless-net/.env.infra ]; then
+            echo "ERROR: .env.infra not created by deploy-osac"
+            exit 1
+          fi
+          echo "=== .env.infra ==="
+          cat infra/agentless-net/.env.infra
+
+      - name: Gather infra diagnostics (stub)
+        if: always()
+        continue-on-error: true
+        run: make gather-infra INFRA=agentless-net
+
+      - name: Gather CaaS diagnostics (stub)
+        if: always()
+        continue-on-error: true
+        run: make gather-suite INFRA=agentless-net SUITE=caas
+
+  # TEMP: inlined teardown using GitHub secrets instead of calling
+  # ec2-runner-teardown.yml (which requires osac-ci-orchestrator + Vault).
+  teardown:
+    needs: [provision, push-secrets, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws &>/dev/null; then
+            curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            sudo /tmp/aws/install
+          fi
+
+      - name: Deregister GitHub runner
+        if: needs.provision.outputs.runner-id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.EC2_GITHUB_PAT }}
+        run: |
+          curl -sS -X DELETE \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/${{ needs.provision.outputs.runner-id }}"
+          echo "Deregistered runner ${{ needs.provision.outputs.runner-id }}"
+
+      - name: Terminate EC2 instance
+        if: needs.provision.outputs.instance-id != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.EC2_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.EC2_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+        run: |
+          aws ec2 terminate-instances --instance-ids "${{ needs.provision.outputs.instance-id }}"
+          echo "Terminated instance ${{ needs.provision.outputs.instance-id }}"
